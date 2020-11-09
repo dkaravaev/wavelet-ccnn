@@ -23,23 +23,80 @@ from complexnn.norm import LayerNormalization, ComplexLayerNorm
 
 
 def sanitizedInitGet(init):
-	if   init in ["sqrt_init"]:
-		return sqrt_init
-	elif init in ["complex", "complex_independent",
-	              "glorot_complex", "he_complex"]:
-		return init
-	else:
-		return initializers.get(init)
+    if   init in ["sqrt_init"]:
+        return sqrt_init
+    elif init in ["complex", "complex_independent",
+                  "glorot_complex", "he_complex"]:
+        return init
+    else:
+        return initializers.get(init)
 def sanitizedInitSer(init):
-	if init in [sqrt_init]:
-		return "sqrt_init"
-	elif init == "complex" or isinstance(init, ComplexInit):
-		return "complex"
-	elif init == "complex_independent" or isinstance(init, ComplexIndependentFilters):
-		return "complex_independent"
-	else:
-		return initializers.serialize(init)
+    if init in [sqrt_init]:
+        return "sqrt_init"
+    elif init == "complex" or isinstance(init, ComplexInit):
+        return "complex"
+    elif init == "complex_independent" or isinstance(init, ComplexIndependentFilters):
+        return "complex_independent"
+    else:
+        return initializers.serialize(init)
 
+class ConvFB(Layer):
+    def __init__(self, filters, kernel_size,
+                 dilation_rate=1, kernel_initializer='complex',
+                 bias_initializer='zeros', kernel_regularizer=None,
+                 init_criterion='he', seed=None, epsilon=1e-7, **kwargs):
+        super(ConvFB, self).__init__(**kwargs)
+        self.rank          = 1
+        self.filters       = filters
+        self.kernel_size   = kernel_size
+        self.padding       = conv_utils.normalize_padding('causal')
+        self.dilation_rate = dilation_rate
+        
+        self.kernel_initializer = sanitizedInitGet(kernel_initializer)
+        self.kernel_regularizer = regularizers.get(kernel_regularizer)
+
+        if seed is None:
+            self.seed = np.random.randint(1, 10e6)
+        else:
+            self.seed = seed
+        self.input_spec = InputSpec(ndim=self.rank + 1)
+
+        w = np.linspace(0, 2 * np.pi, self.filters, endpoint=False)
+        n = np.arange(0, self.kernel_size)
+        E = np.zeros(shape=(self.kernel_size, self.filters), dtype=np.complex128)
+        for k in range(self.filters):
+            E[:, k] = np.exp(1j * w[k] * n)
+        self.E = K.variable(E)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[1], self.filters * 2)
+
+    def build(self, input_shape):
+        channel_axis = -1
+        if input_shape[channel_axis] is None:
+            raise ValueError('The channel dimension of the inputs '
+                             'should be defined. Found `None`.')
+        
+        if self.kernel_initializer in {'complex', 'complex_independent'}:
+            kls = {'complex':             ComplexInit,
+                   'complex_independent': ComplexIndependentFilters}[self.kernel_initializer]
+            kern_init = kls(
+                kernel_size=self.kernel_size,
+                input_dim=1, weight_dim=1, nb_filters=1,
+                criterion=self.init_criterion
+            )
+        else:
+            kern_init = self.kernel_initializer
+        
+        self.ir = self.add_weight(
+            (self.kernel_size, 1), initializer=kern_init,
+            name='fir', regularizer=self.kernel_regularizer,
+        )
+
+    def call(self, inputs):
+        return K.conv1d(inputs, self.ir * self.E, 
+                        strides=1, padding='causal', 
+                        data_format='channels_last', dilation_rate=self.dilation_rate)
 
 
 class ComplexConv(Layer):
@@ -476,8 +533,8 @@ class ComplexConv1D(ComplexConv):
             Then, a complex multiplication is perfromed as the normalized weights are
             multiplied by the complex scaling factor gamma.
         kernel_initializer: Initializer for the complex `kernel` weights matrix.
-			By default it is 'complex'. The 'complex_independent' 
-			and the usual initializers could also be used.
+            By default it is 'complex'. The 'complex_independent' 
+            and the usual initializers could also be used.
             (see keras.initializers and init.py).
         bias_initializer: Initializer for the bias vector
             (see keras.initializers).
@@ -604,8 +661,8 @@ class ComplexConv2D(ComplexConv):
             Then, a complex multiplication is perfromed as the normalized weights are
             multiplied by the complex scaling factor gamma.
         kernel_initializer: Initializer for the complex `kernel` weights matrix.
-			By default it is 'complex'. The 'complex_independent' 
-			and the usual initializers could also be used.
+            By default it is 'complex'. The 'complex_independent' 
+            and the usual initializers could also be used.
             (see keras.initializers and init.py).
         bias_initializer: Initializer for the bias vector
             (see keras.initializers).
@@ -740,8 +797,8 @@ class ComplexConv3D(ComplexConv):
             Then, a complex multiplication is perfromed as the normalized weights are
             multiplied by the complex scaling factor gamma.
         kernel_initializer: Initializer for the complex `kernel` weights matrix.
-			By default it is 'complex'. The 'complex_independent' 
-			and the usual initializers could also be used.
+            By default it is 'complex'. The 'complex_independent' 
+            and the usual initializers could also be used.
             (see keras.initializers and init.py).
         bias_initializer: Initializer for the bias vector
             (see keras.initializers).
@@ -819,12 +876,12 @@ class ComplexConv3D(ComplexConv):
 
 
 class WeightNorm_Conv(_Conv):
-	# Real-valued Convolutional Layer that normalizes its weights
-	# before convolving the input.
-	# The weight Normalization performed the one
-	# described in the following paper:
-	# Weight Normalization: A Simple Reparameterization to Accelerate Training of Deep Neural Networks
-	# (see https://arxiv.org/abs/1602.07868)
+    # Real-valued Convolutional Layer that normalizes its weights
+    # before convolving the input.
+    # The weight Normalization performed the one
+    # described in the following paper:
+    # Weight Normalization: A Simple Reparameterization to Accelerate Training of Deep Neural Networks
+    # (see https://arxiv.org/abs/1602.07868)
 
     def __init__(self,
                  gamma_initializer='ones',
