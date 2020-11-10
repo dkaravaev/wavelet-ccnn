@@ -4,6 +4,8 @@
 #
 # Authors: Chiheb Trabelsi
 
+import scipy.signal
+
 from keras import backend as K
 from keras import activations, initializers, regularizers, constraints
 from keras.layers import Lambda, Layer, InputSpec, Convolution1D, Convolution2D, add, multiply, Activation, Input, concatenate
@@ -14,6 +16,9 @@ from keras.utils import conv_utils
 from keras.models import Model
 import numpy as np
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
+
+import theano.tensor as T
+
 from complexnn.fft import fft, ifft, fft2, ifft2
 from complexnn.bn import ComplexBN as complex_normalization
 from complexnn.bn import sqrt_init
@@ -41,31 +46,33 @@ def sanitizedInitSer(init):
         return initializers.serialize(init)
 
 class ConvFB(Layer):
-    def __init__(self, filters, kernel_size,
-                 dilation_rate=1, kernel_initializer='complex',
-                 bias_initializer='zeros', kernel_regularizer=None,
-                 init_criterion='he', seed=None, epsilon=1e-7, **kwargs):
+    def __init__(self, 
+                 filters, 
+                 kernel_size,
+                 dilation_rate=1, 
+                 kernel_initializer='glorot_normal',
+                 kernel_regularizer=None,
+                 **kwargs):
         super(ConvFB, self).__init__(**kwargs)
         self.rank          = 1
         self.filters       = filters
-        self.kernel_size   = kernel_size
+        self.kernel_size   = kernel_size # For test: 129
         self.padding       = conv_utils.normalize_padding('causal')
         self.dilation_rate = dilation_rate
         
         self.kernel_initializer = sanitizedInitGet(kernel_initializer)
         self.kernel_regularizer = regularizers.get(kernel_regularizer)
 
-        if seed is None:
-            self.seed = np.random.randint(1, 10e6)
-        else:
-            self.seed = seed
-        self.input_spec = InputSpec(ndim=self.rank + 1)
-
         w = np.linspace(0, 2 * np.pi, self.filters, endpoint=False)
         n = np.arange(0, self.kernel_size)
-        E = np.zeros(shape=(self.kernel_size, self.filters), dtype=np.complex128)
+        E = np.zeros(shape=(self.kernel_size, 1, self.filters * 2), dtype=np.float32)
+
+        m = self.filters
         for k in range(self.filters):
-            E[:, k] = np.exp(1j * w[k] * n)
+            e = np.exp(1j * w[k] * n)
+            E[:, 0,     k] = np.real(e)
+            E[:, 0, m + k] = np.imag(e)
+
         self.E = K.variable(E)
 
     def compute_output_shape(self, input_shape):
@@ -76,26 +83,35 @@ class ConvFB(Layer):
         if input_shape[channel_axis] is None:
             raise ValueError('The channel dimension of the inputs '
                              'should be defined. Found `None`.')
-        
-        if self.kernel_initializer in {'complex', 'complex_independent'}:
-            kls = {'complex':             ComplexInit,
-                   'complex_independent': ComplexIndependentFilters}[self.kernel_initializer]
-            kern_init = kls(
-                kernel_size=self.kernel_size,
-                input_dim=1, weight_dim=1, nb_filters=1,
-                criterion=self.init_criterion
-            )
-        else:
-            kern_init = self.kernel_initializer
-        
+        # For test:
+        # kaiser = scipy.signal.firwin(numtaps=self.kernel_size, cutoff=0.1, pass_zero="lowpass", window='kaiser', width=0.001)
+        # self.ir = K.variable(kaiser.reshape(self.kernel_size, 1, 1))
         self.ir = self.add_weight(
-            (self.kernel_size, 1), initializer=kern_init,
-            name='fir', regularizer=self.kernel_regularizer,
+            shape=(self.kernel_size, 1, 1), name='fir', 
+            initializer=self.kernel_initializer,
+            regularizer=self.kernel_regularizer
         )
 
-    def call(self, inputs):
-        return K.conv1d(inputs, self.ir * self.E, 
-                        strides=1, padding='causal', 
+        self.input_spec = InputSpec(ndim=self.rank + 2, axes={channel_axis: 2})
+        self.build = True
+        
+
+    def call(self, S):
+        F = T.addbroadcast(self.ir, 2) * self.E
+        F._keras_shape = self.E._keras_shape
+
+        F_real = F[:, :, : self.filters]
+        F_imag = F[:, :, self.filters :]
+
+        F_real._keras_shape = self.E._keras_shape[:-1] + (self.filters, )
+        F_imag._keras_shape = self.E._keras_shape[:-1] + (self.filters, )
+
+        F_4_real    = K.concatenate([F_real, -F_imag], axis=-2)
+        F_4_imag    = K.concatenate([F_imag,  F_real], axis=-2)
+        F_4_complex = K.concatenate([F_4_real, F_4_imag], axis=-1)
+        F_4_complex._keras_shape = (self.kernel_size, 2, 2 * self.filters)
+
+        return K.conv1d(S, F_4_complex, strides=1, padding='causal', 
                         data_format='channels_last', dilation_rate=self.dilation_rate)
 
 
